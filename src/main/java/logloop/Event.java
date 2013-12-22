@@ -10,6 +10,8 @@ import logloop.jdbi.SyntaxErrorOrAccessRuleViolation.UndefinedTableException;
 
 import org.skife.jdbi.v2.DBI;
 import org.skife.jdbi.v2.Handle;
+import org.skife.jdbi.v2.TransactionCallback;
+import org.skife.jdbi.v2.TransactionStatus;
 import org.skife.jdbi.v2.Update;
 import org.skife.jdbi.v2.exceptions.UnableToExecuteStatementException;
 
@@ -67,34 +69,53 @@ public class Event {
 	 * Creates a child relation of logloop.events to group the events by day.
 	 */
 	private void createRelation(DBI dbi) {
-		String relation = getRelation();
+		final String relation = getRelation();
 
 		Calendar time = Calendar.getInstance();
 		time.setTimeInMillis(timestamp.getTime());
 
-		Calendar dayBegin = (Calendar) time.clone();
+		final Calendar dayBegin = (Calendar) time.clone();
 		dayBegin.set(Calendar.HOUR_OF_DAY, 0);
 		dayBegin.set(Calendar.MINUTE, 0);
 		dayBegin.set(Calendar.SECOND, 0);
 		dayBegin.set(Calendar.MILLISECOND, 0);
 
-		Calendar dayEnd = (Calendar) dayBegin.clone();
+		final Calendar dayEnd = (Calendar) dayBegin.clone();
 		dayEnd.add(Calendar.DATE, 1);
 
-		try (Handle h = dbi.open()) {
-			h.createStatement(
-					"CREATE TABLE " + relation + "(" + "  CONSTRAINT pk_"
-							+ getRelationName() + "_uuid PRIMARY KEY (uuid),"
-							+ "  CONSTRAINT chk_" + getRelationName()
-							+ "_timestamp CHECK (\"timestamp\" >= '"
-							+ toYMD(dayBegin) + "'::date AND \"timestamp\" < '"
-							+ toYMD(dayEnd) + "'::date)" + ")"
-							+ " INHERITS (logloop.events)").execute();
-			h.createStatement(
-					"CREATE INDEX ix_" + getRelationName() + "_timestamp ON "
-							+ relation + " USING btree (\"timestamp\");")
-					.execute();
-		}
+		dbi.inTransaction(new TransactionCallback<Void>() {
+
+			@Override
+			public Void inTransaction(Handle conn, TransactionStatus status)
+					throws Exception {
+				// Create the relation for the daily events.
+				conn.createStatement(
+						"CREATE TABLE " + relation + "(" + "  CONSTRAINT pk_"
+								+ getRelationName()
+								+ "_uuid PRIMARY KEY (uuid),"
+								+ "  CONSTRAINT chk_" + getRelationName()
+								+ "_timestamp CHECK (\"timestamp\" >= '"
+								+ toYMD(dayBegin)
+								+ "'::date AND \"timestamp\" < '"
+								+ toYMD(dayEnd) + "'::date)" + ")"
+								+ " INHERITS (logloop.events)").execute();
+				conn.createStatement(
+						"CREATE INDEX ix_" + getRelationName()
+								+ "_timestamp ON " + relation
+								+ " USING btree (\"timestamp\");").execute();
+
+				// Record daily events table for easier cleanup of outdated
+				// days.
+				Update schema = conn
+						.createStatement("insert into logloop.events_schema (name, exclusive_upper_bound)"
+								+ " values (#name, #exclusive_upper_bound::timestamp with time zone);");
+				schema.bind("name", getRelationName());
+				schema.bind("exclusive_upper_bound", toYMD(dayEnd));
+				schema.execute();
+
+				return null;
+			}
+		});
 	}
 
 	private String toYMD(Calendar time) {
